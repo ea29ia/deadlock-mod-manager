@@ -310,7 +310,7 @@ impl AddonsBackupManager {
       let source_path = entry.path();
       let entry_name = entry.file_name();
       let entry_name = entry_name.to_string_lossy();
-      if entry_name.as_ref() == ".dmm.json.tmp" {
+      if shard::is_manifest_temp_name(entry_name.as_ref()) {
         // A temp manifest with no canonical `.dmm.json` sibling is the only
         // surviving record of this profile's mod ownership (the process crashed
         // between writing the temp file and renaming it into place). Canonicalize

@@ -245,8 +245,12 @@ fn repair_mod_folder_at(
     return Ok(report);
   }
 
+  // The repairs below rewrite the manifest several times; holding the profile
+  // write lock keeps a concurrent install from interleaving with them.
+  let _profile_lock = crate::mod_manager::profile_lock::lock_profile(base)?;
   if report.manifest_status == ManifestStatus::Healthy {
-    manifest = ProfileVpkManifest::open_for_write(base)?;
+    // The lock is already held, so this must be the nested-opt-in variant.
+    manifest = ProfileVpkManifest::open_for_write_under_lock(base)?;
   } else {
     for folder in &report.staging {
       quarantine_staging_directory(

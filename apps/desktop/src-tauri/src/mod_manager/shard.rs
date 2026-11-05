@@ -342,13 +342,34 @@ impl StagedName {
 /// Names inside a profile directory that belong to an in-progress or crashed
 /// internal operation rather than to the user's addons.
 pub fn is_internal_artifact(name: &str) -> bool {
-  name == ".dmm.json.tmp"
+  is_manifest_sidecar(name)
     || name == crate::mod_manager::conflicts::IGNORES_TEMP_FILENAME
     || name == CLEAR_STAGING_DIR
     || name == REORDER_STAGING_DIR
     || name.starts_with(UPDATE_STAGING_PREFIX)
     || name.starts_with(DELETE_STAGING_PREFIX)
 }
+
+/// Whether a name is any file next to the manifest that belongs to the manager
+/// rather than to the addons: commit temp files, manifest backups, the
+/// quarantine copies of an unreadable manifest.
+pub fn is_manifest_sidecar(name: &str) -> bool {
+  name.starts_with(MANIFEST_TEMP_PREFIX)
+}
+
+/// Whether a name belongs to a VPK manifest commit rather than to the addons.
+///
+/// Saves write through a per-save temp file whose name embeds a pid, a
+/// timestamp and a counter; the older shared `.dmm.json.tmp` is still
+/// recognized so a profile left behind by an earlier build is recovered.
+pub fn is_manifest_temp_name(name: &str) -> bool {
+  name == MANIFEST_TEMP_FILENAME
+    || (name.starts_with(MANIFEST_TEMP_PREFIX) && name.ends_with(MANIFEST_TEMP_SUFFIX))
+}
+
+pub(crate) const MANIFEST_TEMP_FILENAME: &str = ".dmm.json.tmp";
+pub(crate) const MANIFEST_TEMP_PREFIX: &str = ".dmm.json.";
+pub(crate) const MANIFEST_TEMP_SUFFIX: &str = ".tmp";
 
 pub(crate) const CLEAR_STAGING_DIR: &str = ".dmm-clear";
 pub(crate) const REORDER_STAGING_DIR: &str = ".dmm-reorder";

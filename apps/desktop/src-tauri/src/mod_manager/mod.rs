@@ -20,6 +20,7 @@ pub mod mod_health;
 pub mod mod_repository;
 pub mod mods_store;
 pub mod perf_config;
+pub mod profile_lock;
 pub mod repair_backup;
 pub mod shard;
 pub mod shard_report;

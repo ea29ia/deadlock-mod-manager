@@ -1,6 +1,8 @@
 use crate::errors::Error;
+use crate::mod_manager::profile_lock::{ProfileGuard, lock_profile};
 use crate::mod_manager::shard::{
-  CLEAR_STAGING_DIR, ProfileBase, REORDER_STAGING_DIR, ShardIndex, UPDATE_STAGING_PREFIX,
+  CLEAR_STAGING_DIR, MANIFEST_TEMP_FILENAME, MANIFEST_TEMP_PREFIX, MANIFEST_TEMP_SUFFIX,
+  ProfileBase, REORDER_STAGING_DIR, ShardIndex, UPDATE_STAGING_PREFIX,
 };
 use crate::mod_manager::vpk_manager::staging::{RecoveryMode, recover_staging_directory};
 use serde::{Deserialize, Serialize};
@@ -8,13 +10,123 @@ use std::{
   collections::BTreeMap,
   fs,
   io::{ErrorKind, Write},
-  path::Path,
+  ops::{Deref, DerefMut},
+  path::{Path, PathBuf},
+  sync::atomic::{AtomicU64, Ordering},
+  time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 mod legacy_reorder;
 
 const MANIFEST_FILENAME: &str = ".dmm.json";
 const CURRENT_MANIFEST_VERSION: u32 = 3;
+
+/// Distinguishes the temp files of saves running in this process.
+static MANIFEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// How long a temp file written by another live process is left alone before it
+/// is treated as abandoned. A commit holds the temp file for a single fsync.
+const MANIFEST_TEMP_TTL: Duration = Duration::from_secs(60);
+
+/// Path for the temp file one [`ProfileVpkManifest::save`] commits through.
+///
+/// The name carries the writing process and a monotonic counter so that two
+/// saves never share a file, in this process or in another one.
+fn next_manifest_temp_path(addons_path: &Path) -> PathBuf {
+  let counter = MANIFEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+  let nanos = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|elapsed| elapsed.as_nanos())
+    .unwrap_or(0);
+
+  addons_path.join(format!(
+    "{MANIFEST_FILENAME}.{}-{nanos}-{counter}.tmp",
+    std::process::id()
+  ))
+}
+
+/// Process that wrote a per-save temp file, if the name is one of ours.
+fn temp_path_pid(name: &str) -> Option<u32> {
+  let suffix = name.strip_prefix(MANIFEST_TEMP_PREFIX)?;
+  let spec = suffix.strip_suffix(MANIFEST_TEMP_SUFFIX)?;
+  let pid = spec.split('-').next()?;
+  pid.parse().ok()
+}
+
+/// Whether a temp file left on disk can be deleted.
+///
+/// Deciding this from the name is what makes the cleanup safe across processes:
+/// the profile write lock only serializes writers inside this process, so a
+/// temp file belonging to a live peer may well be a commit in flight.
+fn should_remove_temp_file(
+  pid: Option<u32>,
+  own_pid: u32,
+  age: Duration,
+  writer_is_alive: bool,
+) -> bool {
+  if pid == Some(own_pid) {
+    // We hold the profile lock, so nothing of ours can be in flight any more.
+    return true;
+  }
+
+  if pid.is_none() {
+    // A name from an older or newer format: only reclaim it once it is
+    // unambiguously old.
+    return age > MANIFEST_TEMP_TTL;
+  }
+
+  !writer_is_alive || age > MANIFEST_TEMP_TTL
+}
+
+fn process_is_alive(pid: u32) -> bool {
+  #[cfg(target_os = "linux")]
+  {
+    Path::new(&format!("/proc/{pid}")).exists()
+  }
+
+  // No portable way to probe another process; the age check covers it.
+  #[cfg(not(target_os = "linux"))]
+  {
+    let _ = pid;
+    true
+  }
+}
+
+/// Manifest read through [`ProfileVpkManifest::open_for_write`], holding the
+/// profile write lock for as long as it is alive.
+///
+/// Dereferences to the manifest so existing call sites keep working unchanged.
+#[derive(Debug)]
+pub struct ManifestWriteGuard {
+  manifest: ProfileVpkManifest,
+  _profile_lock: ProfileGuard,
+}
+
+impl Deref for ManifestWriteGuard {
+  type Target = ProfileVpkManifest;
+
+  fn deref(&self) -> &Self::Target {
+    &self.manifest
+  }
+}
+
+impl DerefMut for ManifestWriteGuard {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    &mut self.manifest
+  }
+}
+
+impl PartialEq<ProfileVpkManifest> for ManifestWriteGuard {
+  fn eq(&self, other: &ProfileVpkManifest) -> bool {
+    self.manifest == *other
+  }
+}
+
+impl PartialEq<ManifestWriteGuard> for ProfileVpkManifest {
+  fn eq(&self, other: &ManifestWriteGuard) -> bool {
+    *self == other.manifest
+  }
+}
 
 const fn current_manifest_version() -> u32 {
   CURRENT_MANIFEST_VERSION
@@ -204,7 +316,7 @@ impl ProfileVpkManifest {
   /// files are reconciled by [`Self::open_for_write`].
   pub fn load(addons_path: &Path) -> Result<Self, Error> {
     let manifest_path = addons_path.join(MANIFEST_FILENAME);
-    let temp_path = addons_path.join(format!("{MANIFEST_FILENAME}.tmp"));
+    let temp_path = addons_path.join(MANIFEST_TEMP_FILENAME);
 
     let source_path = if manifest_path.exists() {
       Some(manifest_path.clone())
@@ -253,7 +365,22 @@ impl ProfileVpkManifest {
   /// Only mutation entry points may call this. Reads must use [`Self::load`],
   /// which never writes -- notably [`Self::profile_failures`], which walks backup
   /// snapshots that must come out byte-identical.
-  pub fn open_for_write(addons_path: &Path) -> Result<Self, Error> {
+  pub fn open_for_write(addons_path: &Path) -> Result<ManifestWriteGuard, Error> {
+    let profile_lock = lock_profile(addons_path)?;
+    let manifest = Self::open_for_write_under_lock(addons_path)?;
+    Ok(ManifestWriteGuard {
+      manifest,
+      _profile_lock: profile_lock,
+    })
+  }
+
+  /// Same repair-and-read cycle for a caller that already holds the profile
+  /// lock, e.g. one that keeps several saves inside a single critical section.
+  ///
+  /// Taking [`lock_profile`] twice on one thread is a lost update by
+  /// construction, so it is rejected rather than nested; this is the escape
+  /// hatch for the legitimate case.
+  pub fn open_for_write_under_lock(addons_path: &Path) -> Result<ProfileVpkManifest, Error> {
     crate::mod_manager::file_permissions::prepare_profile_for_write(addons_path)?;
     Self::reconcile_manifest_temp_file(addons_path)?;
     let manifest = Self::load(addons_path)?;
@@ -269,8 +396,14 @@ impl ProfileVpkManifest {
 
   fn reconcile_manifest_temp_file(addons_path: &Path) -> Result<(), Error> {
     let manifest_path = addons_path.join(MANIFEST_FILENAME);
-    let temp_path = addons_path.join(format!("{MANIFEST_FILENAME}.tmp"));
 
+    // A commit is a fsync'ed write followed by a rename, so a temp file is a
+    // complete manifest. If the main file is gone, the newest temp file is the
+    // newest state we have and is promoted rather than deleted.
+    Self::recover_newest_save_temp(addons_path, &manifest_path);
+    Self::remove_stale_manifest_temps(addons_path);
+
+    let temp_path = addons_path.join(MANIFEST_TEMP_FILENAME);
     if !temp_path.exists() {
       return Ok(());
     }
@@ -345,7 +478,10 @@ impl ProfileVpkManifest {
     fs::create_dir_all(addons_path)?;
 
     let manifest_path = addons_path.join(MANIFEST_FILENAME);
-    let temp_path = addons_path.join(format!("{MANIFEST_FILENAME}.tmp"));
+    // One temp file per save, never a shared `.dmm.json.tmp`: two saves on the
+    // same profile must not overwrite each other's file, and a concurrent
+    // `open_for_write` must not delete a commit that is still in flight.
+    let temp_path = next_manifest_temp_path(addons_path);
     let manifest_json = serde_json::to_string_pretty(self).map_err(|e| {
       Error::InvalidInput(format!(
         "Failed to serialize VPK manifest at {}: {e}",
@@ -353,24 +489,183 @@ impl ProfileVpkManifest {
       ))
     })?;
 
-    crate::mod_manager::file_permissions::ensure_file_writable(&manifest_path)?;
-    crate::mod_manager::file_permissions::ensure_file_writable(&temp_path)?;
-    // Flush before the rename: NTFS journals the rename and file size, so a
-    // power loss after an unsynced write leaves a manifest of NUL bytes.
-    let mut temp_file = fs::File::create(&temp_path)?;
-    temp_file.write_all(manifest_json.as_bytes())?;
-    temp_file.sync_all()?;
-    drop(temp_file);
-    if let Err(err) = fs::rename(&temp_path, &manifest_path) {
-      if err.kind() == ErrorKind::AlreadyExists {
-        fs::remove_file(&manifest_path)?;
-        fs::rename(&temp_path, &manifest_path)?;
-      } else {
-        return Err(err.into());
+    if let Err(error) = Self::commit_manifest(&manifest_json, &temp_path, &manifest_path) {
+      // The temp file holds the only complete copy when the rename failed, so
+      // it is kept whenever the manifest itself did not make it to disk: the
+      // next `open_for_write` promotes it back.
+      if manifest_path.exists() {
+        let _ = fs::remove_file(&temp_path);
       }
+      return Err(error);
     }
 
     Ok(())
+  }
+
+  fn commit_manifest(
+    manifest_json: &str,
+    temp_path: &Path,
+    manifest_path: &Path,
+  ) -> Result<(), Error> {
+    crate::mod_manager::file_permissions::ensure_file_writable(manifest_path)?;
+    crate::mod_manager::file_permissions::ensure_file_writable(temp_path)?;
+    // Flush before the rename: NTFS journals the rename and file size, so a
+    // power loss after an unsynced write leaves a manifest of NUL bytes.
+    let mut temp_file = fs::File::create(temp_path)?;
+    temp_file.write_all(manifest_json.as_bytes())?;
+    temp_file.sync_all()?;
+    drop(temp_file);
+    if let Err(err) = fs::rename(temp_path, manifest_path) {
+      // Rust maps `fs::rename` to `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on
+      // Windows, so an existing target does not normally surface at all. Keep a
+      // fallback anyway, but never delete the manifest and hope: the old one is
+      // parked next to the new and restored if the swap fails, so no sequence of
+      // failures can lose both copies.
+      if err.kind() != ErrorKind::AlreadyExists {
+        return Err(err.into());
+      }
+      Self::swap_manifest_over_existing(temp_path, manifest_path)?;
+    }
+
+    Ok(())
+  }
+
+  fn swap_manifest_over_existing(temp_path: &Path, manifest_path: &Path) -> Result<(), Error> {
+    let backup_path = manifest_path.with_file_name(format!(
+      "{MANIFEST_TEMP_PREFIX}replaced-{}",
+      SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0)
+    ));
+    fs::rename(manifest_path, &backup_path)?;
+
+    match fs::rename(temp_path, manifest_path) {
+      Ok(()) => {
+        if let Err(error) = fs::remove_file(&backup_path) {
+          log::warn!(
+            "Replaced VPK manifest but failed to remove its backup at {}: {error}",
+            backup_path.display()
+          );
+        }
+        Ok(())
+      }
+      Err(swap_error) => {
+        if let Err(restore_error) = fs::rename(&backup_path, manifest_path) {
+          log::error!(
+            "Failed to restore VPK manifest from {} after a failed swap ({swap_error}): {restore_error}",
+            backup_path.display()
+          );
+        }
+        Err(swap_error.into())
+      }
+    }
+  }
+
+  /// Promote the newest per-save temp file when the manifest is missing.
+  ///
+  /// Covers both a save that crashed between fsync and rename and a failed
+  /// [`Self::swap_manifest_over_existing`]: the temp file is a complete
+  /// manifest, so leaving it behind as garbage would throw away the newest
+  /// state the profile has.
+  fn recover_newest_save_temp(addons_path: &Path, manifest_path: &Path) {
+    if manifest_path.exists() {
+      return;
+    }
+
+    let entries = match fs::read_dir(addons_path) {
+      Ok(entries) => entries,
+      Err(_) => return,
+    };
+
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+      let file_name = entry.file_name();
+      let Some(name) = file_name.to_str() else {
+        continue;
+      };
+      // The legacy name is handled separately below, and a non-zero length is
+      // required because a temp file is only complete after `sync_all`.
+      if name == MANIFEST_TEMP_FILENAME || temp_path_pid(name).is_none() {
+        continue;
+      }
+      let Ok(metadata) = entry.metadata() else {
+        continue;
+      };
+      if metadata.len() == 0 {
+        continue;
+      }
+      let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+      if newest.as_ref().is_none_or(|(seen, _)| modified > *seen) {
+        newest = Some((modified, entry.path()));
+      }
+    }
+
+    if let Some((_, path)) = newest {
+      if let Err(error) = fs::rename(&path, manifest_path) {
+        log::warn!(
+          "Failed to recover VPK manifest from {} to {}: {error}",
+          path.display(),
+          manifest_path.display()
+        );
+      } else {
+        log::warn!(
+          "Recovered VPK manifest at {} from an uncommitted temp file",
+          manifest_path.display()
+        );
+      }
+    }
+  }
+
+  /// Drop manifest temp files left behind by a crashed save.
+  ///
+  /// The profile write lock only serializes writers in this process, so a temp
+  /// file's name -- the pid of its writer -- and age decide whether it can go: a
+  /// live peer may be committing right now and must not lose its rename.
+  fn remove_stale_manifest_temps(addons_path: &Path) {
+    let entries = match fs::read_dir(addons_path) {
+      Ok(entries) => entries,
+      Err(_) => return,
+    };
+
+    let own_pid = std::process::id();
+    for entry in entries.flatten() {
+      let file_name = entry.file_name();
+      let Some(name) = file_name.to_str() else {
+        continue;
+      };
+
+      // The legacy name is reconciled by the caller: its content may be the
+      // only copy of the manifest, so it is never deleted here.
+      if name == MANIFEST_TEMP_FILENAME {
+        continue;
+      }
+      let pid = temp_path_pid(name);
+      if pid.is_none() {
+        continue;
+      }
+
+      let Ok(metadata) = entry.metadata() else {
+        continue;
+      };
+      let path = entry.path();
+      let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .unwrap_or_default();
+      let writer_is_alive = pid.is_some_and(process_is_alive);
+      if !should_remove_temp_file(pid, own_pid, age, writer_is_alive) {
+        continue;
+      }
+
+      if let Err(error) = fs::remove_file(&path) {
+        log::debug!(
+          "Failed to remove stale VPK manifest temp file {}: {error}",
+          path.display()
+        );
+      }
+    }
   }
 
   pub fn mark_enabled(
@@ -947,5 +1242,194 @@ mod tests {
     let old: ProfileVpkManifestEntry = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
     assert!(!old.compatibility_enabled);
     assert!(!old.compatibility_opted_out);
+  }
+
+  /// Saves must not share one temp name: a second writer truncating the first
+  /// writer's file is what turned a reinstall into "No such file or directory".
+  #[test]
+  fn every_save_uses_its_own_temp_file_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = addons_base(&temp);
+    let mut manifest = ProfileVpkManifest::default();
+    manifest.mark_enabled(
+      "123",
+      vec!["pak01_dir.vpk".to_string()],
+      vec!["cool_mod.vpk".to_string()],
+      Some(0),
+      ShardIndex::FIRST,
+    );
+
+    manifest.save(&base).unwrap();
+
+    let leftovers: Vec<String> = fs::read_dir(&base)
+      .unwrap()
+      .flatten()
+      .map(|entry| entry.file_name().to_string_lossy().to_string())
+      .filter(|name| crate::mod_manager::shard::is_manifest_temp_name(name))
+      .collect();
+    assert!(
+      leftovers.is_empty(),
+      "a committed save must not leave temp files: {leftovers:?}"
+    );
+    assert_eq!(ProfileVpkManifest::load(&base).unwrap(), manifest);
+
+    let first = next_manifest_temp_path(&base);
+    let second = next_manifest_temp_path(&base);
+    assert_ne!(first, second);
+    assert!(crate::mod_manager::shard::is_internal_artifact(
+      first.file_name().unwrap().to_str().unwrap()
+    ));
+  }
+
+  /// A crashed save leaves a uniquely named temp file; the write path owns the
+  /// profile at that point, so it can and should clear it.
+  #[test]
+  fn open_for_write_removes_stale_unique_temp_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = addons_base(&temp);
+    let mut manifest = ProfileVpkManifest::default();
+    manifest.mark_enabled(
+      "123",
+      vec!["pak01_dir.vpk".to_string()],
+      vec!["cool_mod.vpk".to_string()],
+      Some(0),
+      ShardIndex::FIRST,
+    );
+    manifest.save(&base).unwrap();
+    // Named with this process's pid: the profile lock is held, so a temp file
+    // of ours cannot be a commit in flight.
+    let stale = base.join(format!(".dmm.json.{}-1-1.tmp", std::process::id()));
+    fs::write(&stale, "{}").unwrap();
+
+    let loaded = ProfileVpkManifest::open_for_write(&base).unwrap();
+
+    assert_eq!(loaded, manifest);
+    assert!(
+      !stale.exists(),
+      "open_for_write must drop temp files no writer owns"
+    );
+  }
+
+  /// Another process may be committing right now: its temp file must survive,
+  /// because deleting it turns its rename into `ENOENT` -- the reported bug.
+  #[test]
+  fn temp_file_of_a_live_peer_is_left_alone() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = addons_base(&temp);
+    ProfileVpkManifest::default().save(&base).unwrap();
+    let peer_pid = std::process::id() + 1;
+    let peer_temp = base.join(format!(".dmm.json.{peer_pid}-1-1.tmp"));
+    fs::write(&peer_temp, "{}").unwrap();
+
+    let keep = should_remove_temp_file(Some(peer_pid), std::process::id(), Duration::ZERO, true);
+    let reclaim = should_remove_temp_file(
+      Some(peer_pid),
+      std::process::id(),
+      MANIFEST_TEMP_TTL + Duration::from_secs(1),
+      true,
+    );
+    assert!(!keep, "a live writer's temp file must not be deleted");
+    assert!(
+      reclaim,
+      "an abandoned temp file must eventually be reclaimed"
+    );
+
+    // Our own leftovers, and those of a process that is gone, are reclaimable
+    // immediately.
+    assert!(should_remove_temp_file(
+      Some(std::process::id()),
+      std::process::id(),
+      Duration::ZERO,
+      true
+    ));
+    assert!(should_remove_temp_file(
+      Some(peer_pid),
+      std::process::id(),
+      Duration::ZERO,
+      false
+    ));
+    assert_eq!(temp_path_pid(".dmm.json.4242-7-3.tmp"), Some(4242));
+    assert_eq!(temp_path_pid(".dmm.json.tmp"), None);
+    assert_eq!(temp_path_pid(".dmm.json"), None);
+  }
+
+  /// A save that crashed between `sync_all` and the rename, or a failed swap,
+  /// leaves the newest complete manifest in a temp file. Deleting it would
+  /// throw away the newest state the profile has.
+  #[test]
+  fn open_for_write_recovers_newest_save_temp_when_manifest_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = addons_base(&temp);
+    let mut manifest = ProfileVpkManifest::default();
+    manifest.mark_enabled(
+      "123",
+      vec!["pak01_dir.vpk".to_string()],
+      vec!["cool_mod.vpk".to_string()],
+      Some(0),
+      ShardIndex::FIRST,
+    );
+    manifest.save(&base).unwrap();
+    let manifest_path = base.join(MANIFEST_FILENAME);
+    let crashed = base.join(format!(".dmm.json.{}-1-1.tmp", std::process::id()));
+    fs::rename(&manifest_path, &crashed).unwrap();
+    // An older, empty remnant must not win over the complete copy.
+    fs::write(
+      base.join(format!(".dmm.json.{}-0-0.tmp", std::process::id())),
+      "",
+    )
+    .unwrap();
+
+    let recovered = ProfileVpkManifest::open_for_write(&base).unwrap();
+
+    assert_eq!(recovered, manifest);
+    assert!(manifest_path.exists());
+    assert_eq!(ProfileVpkManifest::load(&base).unwrap(), manifest);
+  }
+
+  /// The regression this fix exists for: a reinstall purges the old mod from the
+  /// manifest while the download worker persists the new one. Both write, so
+  /// with a shared temp name the second `open_for_write` deleted the first one's
+  /// commit and the rename failed with ENOENT.
+  #[test]
+  fn overlapping_profile_writes_all_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = addons_base(&temp);
+
+    let handles: Vec<_> = (0..8)
+      .map(|thread| {
+        let base = base.clone();
+        std::thread::spawn(move || {
+          for round in 0..20 {
+            let mod_id = format!("mod-{thread}-{round}");
+            let mut manifest = ProfileVpkManifest::open_for_write(&base).unwrap();
+            manifest.mark_enabled(
+              &mod_id,
+              vec![format!("{mod_id}_pak01_dir.vpk")],
+              Vec::new(),
+              Some(round),
+              ShardIndex::FIRST,
+            );
+            manifest.save(&base).unwrap();
+          }
+        })
+      })
+      .collect();
+
+    for handle in handles {
+      handle.join().unwrap();
+    }
+
+    // Serialized read-modify-write means no update is lost, not merely that no
+    // call fails.
+    let committed = ProfileVpkManifest::load(&base).unwrap();
+    for thread in 0..8 {
+      for round in 0..20 {
+        let mod_id = format!("mod-{thread}-{round}");
+        assert!(
+          committed.mods.contains_key(&mod_id),
+          "{mod_id} was lost by a concurrent writer"
+        );
+      }
+    }
   }
 }
